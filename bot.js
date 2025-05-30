@@ -4,7 +4,7 @@ import { readFile, writeFile } from "fs/promises";
 class DataStorage {
     constructor(filename = "bot_data.json") {
         this.filename = filename;
-        this.data = { users: {}, stats: { totalMessages: 0 } };
+        this.data = { users: {} };
     }
 
     async loadData() {
@@ -12,7 +12,7 @@ class DataStorage {
             const fileContent = await readFile(this.filename, "utf8");
             this.data = JSON.parse(fileContent);
         } catch {
-            this.data = { users: {}, stats: { totalMessages: 0 } };
+            this.data = { users: {} };
             await this.saveData();
         }
     }
@@ -359,29 +359,7 @@ I promemoria vengono inviati automaticamente alla data e ora specificata!
             res += `\n*${index + 1}.* ${reminder.msg}\n📅 ${date.toLocaleString("it-IT")}\n`;
         });
 
-        res += `\n_Scrivi solo il numero (es: 1, 2, 3...)_`;
-
-        pendingDeletions.set(userId, { reminders: activeReminders });
-        bot.sendMessage(chatId, res, { parse_mode: "Markdown" });
-    });    // Keep the old /all command for backward compatibility
-    bot.onText(/\/all/, (msg) => {
-        const chatId = msg.chat.id;
-        const userId = msg.from.id;
-        const user = storage.getUser(userId);
-
-        let res = `**I tuoi promemoria:**\n`;
-
-        if (user.reminders && user.reminders.length > 0) {
-            user.reminders.forEach((reminder, index) => {
-                const date = new Date(reminder.datetime);
-                const status = reminder.sent ? " ✅" : "";
-                res += `\n*${index + 1}.* ${reminder.msg
-                    }\n🕒 ${date.toLocaleString("it-IT")}${status}\n`;
-            });
-        } else {
-            res += "Nessun promemoria impostato.";
-        }
-
+        res += `\n_Scrivi solo il numero (es: 1, 2, 3...)_`;        pendingDeletions.set(userId, { reminders: activeReminders });
         bot.sendMessage(chatId, res, { parse_mode: "Markdown" });
     });
 }
