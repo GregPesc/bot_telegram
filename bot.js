@@ -1,5 +1,6 @@
 import TelegramBot from "node-telegram-bot-api";
-import { readFile, writeFile } from "fs/promises";
+import { readFile, writeFile, rename } from "fs/promises";
+import { existsSync, unlinkSync } from "fs";
 
 class DataStorage {
   constructor(filename = "bot_data.json") {
@@ -16,12 +17,28 @@ class DataStorage {
       await this.saveData();
     }
   }
-
   async saveData() {
     try {
-      await writeFile(this.filename, JSON.stringify(this.data, null, 2));
+      // Use atomic write by writing to a temporary file first
+      const tempFile = this.filename + ".tmp";
+      await writeFile(tempFile, JSON.stringify(this.data, null, 2));
+
+      // Only after successful write, replace the original file
+      await rename(tempFile, this.filename);
     } catch (error) {
       console.error("Errore nel salvataggio:", error);
+      // Try to clean up temp file if it exists
+      try {
+        const tempFile = this.filename + ".tmp";
+        if (existsSync(tempFile)) {
+          unlinkSync(tempFile);
+        }
+      } catch (cleanupError) {
+        console.error(
+          "Errore nella pulizia del file temporaneo:",
+          cleanupError
+        );
+      }
     }
   }
 
@@ -55,6 +72,36 @@ class DataStorage {
       return true;
     }
     return false;
+  }
+
+  clearReminders(userId, clearAll = false) {
+    const user = this.getUser(userId);
+    if (!user.reminders)
+      return { deleted: 0, message: "Nessun promemoria da eliminare." };
+
+    const initialCount = user.reminders.length;
+
+    if (clearAll) {
+      // Delete all reminders
+      user.reminders = [];
+      this.saveData();
+      return {
+        deleted: initialCount,
+        message: `Eliminati tutti i ${initialCount} promemoria.`,
+      };
+    } else {
+      // Delete only completed reminders
+      const completedCount = user.reminders.filter((r) => r.sent).length;
+      user.reminders = user.reminders.filter((r) => !r.sent);
+      this.saveData();
+      return {
+        deleted: completedCount,
+        message:
+          completedCount > 0
+            ? `Eliminati ${completedCount} promemoria completati.`
+            : "Nessun promemoria completato da eliminare.",
+      };
+    }
   }
 
   getAllActiveReminders() {
@@ -137,13 +184,13 @@ Comandi disponibili:
 • /add - Crea un nuovo promemoria
 • /list - Mostra tutti i tuoi promemoria
 • /del - Elimina un promemoria
+• /clear - Elimina promemoria completati
 • /help - Mostra tutti i comandi nello specifico
 
 Inizia creando il tuo primo promemoria con /add!
         `;
     bot.sendMessage(chatId, welcomeMessage, { parse_mode: "Markdown" });
   });
-
   bot.onText(/\/help/, (msg) => {
     const chatId = msg.chat.id;
     const helpMessage = `
@@ -153,6 +200,7 @@ Inizia creando il tuo primo promemoria con /add!
 • /add - Crea un nuovo promemoria
 • /list - Mostra tutti i tuoi promemoria
 • /del - Elimina un promemoria
+• /clear - Elimina promemoria completati
 
 *Come usare /add:*
 1. Scrivi /add
@@ -162,6 +210,10 @@ Inizia creando il tuo primo promemoria con /add!
 *Come usare /del:*
 1. Scrivi /del
 2. Scegli il numero del promemoria da eliminare
+
+*Come usare /clear:*
+• /clear - Elimina solo i promemoria completati
+• /clear all - Elimina TUTTI i promemoria (anche quelli futuri)
 
 I promemoria vengono inviati automaticamente alla data e ora specificata!
         `;
@@ -176,7 +228,7 @@ I promemoria vengono inviati automaticamente alla data e ora specificata!
       parse_mode: "Markdown",
     });
   });
-  
+
   // Consolidated message handler
   bot.on("message", (msg) => {
     const userId = msg.from.id;
@@ -184,45 +236,70 @@ I promemoria vengono inviati automaticamente alla data e ora specificata!
     const text = msg.text;
 
     // Ignore commands and bot's own messages
-    if (!text || text.startsWith("/") || !msg.from || msg.from.is_bot) return;
+    if (!text || text.startsWith("/") || !msg.from || msg.from.is_bot) return; // Handle reminder deletion first (don't update user info during deletion to avoid race conditions)
+    if (pendingDeletions.has(userId)) {
+      const session = pendingDeletions.get(userId);
 
-    // Update user info
+      // Handle confirmation for "clear all" command
+      if (session.type === "clear_all" && session.awaitingConfirmation) {
+        if (text.toUpperCase() === "CONFERMA") {
+          const result = storage.clearReminders(userId, true);
+          bot.sendMessage(chatId, `✅ ${result.message}`, {
+            parse_mode: "Markdown",
+          });
+        } else {
+          bot.sendMessage(
+            chatId,
+            "❌ Operazione annullata. I tuoi promemoria sono al sicuro.",
+            {
+              parse_mode: "Markdown",
+            }
+          );
+        }
+        pendingDeletions.delete(userId);
+        return;
+      }
+
+      // Handle normal reminder deletion by index
+      if (session.reminders) {
+        const reminderIndex = parseInt(text) - 1;
+
+        if (
+          isNaN(reminderIndex) ||
+          reminderIndex < 0 ||
+          reminderIndex >= session.reminders.length
+        ) {
+          bot.sendMessage(chatId, "❌ Numero non valido. Riprova con /del");
+          pendingDeletions.delete(userId);
+          return;
+        }
+
+        const reminderToDelete = session.reminders[reminderIndex];
+        const success = storage.deleteReminder(userId, reminderToDelete.id);
+
+        if (success) {
+          bot.sendMessage(
+            chatId,
+            `✅ Promemoria eliminato:\n"${reminderToDelete.msg}"`
+          );
+        } else {
+          bot.sendMessage(
+            chatId,
+            "❌ Errore nell'eliminazione del promemoria."
+          );
+        }
+
+        pendingDeletions.delete(userId);
+        return;
+      }
+    }
+
+    // Update user info only when not processing deletions
     storage.updateUser(userId, {
       firstName: msg.from.first_name,
       username: msg.from.username,
       messageCount: storage.getUser(userId).messageCount + 1,
     });
-
-    // Handle reminder deletion first
-    if (pendingDeletions.has(userId)) {
-      const session = pendingDeletions.get(userId);
-      const reminderIndex = parseInt(text) - 1;
-
-      if (
-        isNaN(reminderIndex) ||
-        reminderIndex < 0 ||
-        reminderIndex >= session.reminders.length
-      ) {
-        bot.sendMessage(chatId, "❌ Numero non valido. Riprova con /del");
-        pendingDeletions.delete(userId);
-        return;
-      }
-
-      const reminderToDelete = session.reminders[reminderIndex];
-      const success = storage.deleteReminder(userId, reminderToDelete.id);
-
-      if (success) {
-        bot.sendMessage(
-          chatId,
-          `✅ Promemoria eliminato:\n"${reminderToDelete.msg}"`
-        );
-      } else {
-        bot.sendMessage(chatId, "❌ Errore nell'eliminazione del promemoria.");
-      }
-
-      pendingDeletions.delete(userId);
-      return;
-    }
 
     // Handle reminder creation
     if (pendingReminders.has(userId)) {
@@ -385,10 +462,59 @@ I promemoria vengono inviati automaticamente alla data e ora specificata!
         "it-IT"
       )}\n`;
     });
-
     res += `\n_Scrivi solo il numero (es: 1, 2, 3...)_`;
     pendingDeletions.set(userId, { reminders: activeReminders });
     bot.sendMessage(chatId, res, { parse_mode: "Markdown" });
+  });
+
+  // /clear command - delete completed reminders or all reminders
+  bot.onText(/\/clear(\s+(.+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const argument = match[2] ? match[2].trim().toLowerCase() : null;
+
+    const user = storage.getUser(userId);
+
+    if (!user.reminders || user.reminders.length === 0) {
+      bot.sendMessage(chatId, "❌ Non hai promemoria da eliminare.", {
+        parse_mode: "Markdown",
+      });
+      return;
+    }
+
+    if (argument === "all") {
+      // Ask for confirmation before deleting all reminders
+      const totalCount = user.reminders.length;
+      const activeCount = user.reminders.filter((r) => !r.sent).length;
+
+      bot.sendMessage(
+        chatId,
+        `⚠️ *Attenzione!*\n\nStai per eliminare TUTTI i ${totalCount} promemoria (${activeCount} attivi e ${
+          totalCount - activeCount
+        } completati).\n\n*Questa azione è irreversibile!*\n\nScrivi "CONFERMA" per procedere o qualsiasi altro messaggio per annullare.`,
+        { parse_mode: "Markdown" }
+      );
+
+      // Set a temporary state to handle confirmation
+      pendingDeletions.set(userId, {
+        type: "clear_all",
+        awaitingConfirmation: true,
+      });
+      return;
+    }
+
+    // Clear only completed reminders
+    const result = storage.clearReminders(userId, false);
+
+    if (result.deleted > 0) {
+      bot.sendMessage(chatId, `✅ ${result.message}`, {
+        parse_mode: "Markdown",
+      });
+    } else {
+      bot.sendMessage(chatId, `ℹ️ ${result.message}`, {
+        parse_mode: "Markdown",
+      });
+    }
   });
 }
 
